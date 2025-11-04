@@ -230,7 +230,7 @@ def save_csv_summary(data, filename):
 
 
 if __name__ == "__main__":
-    anime_ref = "47778"
+    anime_ref = "7"
     print(f"🔍 Mengambil data dari {anime_ref}")
     data = scrape_myanimelist(anime_ref)
     save_json(data, f"anime_{data['myanimelist_id']}_with_characters.json")

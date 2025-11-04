@@ -6,12 +6,15 @@ import os
 import re
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ==========================================
+# KONFIGURASI
+# ==========================================
+START_ID = 1          # ganti sesuai kebutuhan
+END_ID = 5000         # misal 1–5000
+MAX_CONSECUTIVE_404 = 100
+OUTPUT_FILE = "mal_anime_auto_scrape.csv"
 
-# ------------------------------
-#  ROTATING USER AGENTS
-# ------------------------------
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
@@ -20,18 +23,16 @@ USER_AGENTS = [
 ]
 
 
-# ------------------------------
-#  CHARACTER SCRAPER
-# ------------------------------
+# ==========================================
+# SCRAPER FUNGSI
+# ==========================================
 def get_characters(anime_url: str, headers):
-    """Ambil daftar karakter dari halaman /characters"""
     characters_url = anime_url.rstrip("/") + "/characters"
+    print(f"Mengambil karakter dari {characters_url}")
 
-    try:
-        res = requests.get(characters_url, headers=headers, timeout=15)
-        if res.status_code != 200:
-            return []
-    except requests.RequestException:
+    res = requests.get(characters_url, headers=headers)
+    if res.status_code != 200:
+        print(f"Gagal mengambil karakter ({res.status_code})")
         return []
 
     soup = BeautifulSoup(res.text, "html.parser")
@@ -45,29 +46,23 @@ def get_characters(anime_url: str, headers):
         char_name = char_link.get_text(strip=True)
         match_id = re.search(r"/character/(\d+)", char_url)
         char_id = int(match_id.group(1)) if match_id else None
-        characters.append({"id": char_id, "name": char_name, "url": char_url})
 
+        characters.append({
+            "id": char_id,
+            "name": char_name,
+            "url": char_url
+        })
     return characters
 
 
-# ------------------------------
-#  MAIN SCRAPER FOR ONE ANIME
-# ------------------------------
-def scrape_myanimelist(anime_id: int):
-    headers = {"User-Agent": random.choice(USER_AGENTS)}
+def scrape_myanimelist(anime_id: int, headers):
     url = f"https://myanimelist.net/anime/{anime_id}"
-
-    try:
-        res = requests.get(url, headers=headers, timeout=15)
-    except requests.RequestException:
-        print(f"⚠️ Timeout atau error jaringan untuk ID {anime_id}")
-        return None
-
+    res = requests.get(url, headers=headers)
     if res.status_code == 404:
-        print(f"❌ {anime_id} not found")
+        print(f"{anime_id} not found")
         return None
     if res.status_code != 200:
-        print(f"⚠️ Gagal ambil ID {anime_id} ({res.status_code})")
+        print(f"Gagal ambil ID {anime_id} ({res.status_code})")
         return None
 
     soup = BeautifulSoup(res.text, "html.parser")
@@ -75,17 +70,14 @@ def scrape_myanimelist(anime_id: int):
     canonical_tag = soup.find("meta", property="og:url") or soup.find("link", rel="canonical")
     canonical_url = canonical_tag.get("content") if canonical_tag else url
 
-    # Judul dan deskripsi
     title_tag = soup.select_one("h1.title-name, h1.title")
     title = title_tag.get_text(strip=True) if title_tag else None
     description_tag = soup.find("p", itemprop="description")
     description = description_tag.get_text(strip=True) if description_tag else None
 
-    # Gambar
     img = soup.select_one("div.leftside img")
     image_url = img.get("data-src") or img.get("src") if img else None
 
-    # Ekstrak section Info (Type, Episodes, Status, dll)
     def extract_section_between(start_text, end_text=None):
         data = {}
         start = soup.find("h2", string=start_text)
@@ -107,7 +99,6 @@ def scrape_myanimelist(anime_id: int):
 
     info = extract_section_between("Information", "Statistics")
 
-    # Score & Rank
     score_tag = soup.select_one('[itemprop="aggregateRating"] [itemprop="ratingValue"]')
     score = score_tag.get_text(strip=True) if score_tag else None
 
@@ -121,7 +112,6 @@ def scrape_myanimelist(anime_id: int):
         if m:
             rank = f"#{m.group(1)}"
 
-    # Popularity, Members, Favorites
     pop_tag = soup.find("span", string=re.compile("Popularity:"))
     popularity, members, favorites = None, None, None
     if pop_tag:
@@ -136,7 +126,6 @@ def scrape_myanimelist(anime_id: int):
         elif txt.startswith("Favorites:"):
             favorites = re.sub(r"[^0-9,]", "", txt)
 
-    # Released season/year
     premiered = info.get("Premiered")
     released_season, released_year = None, None
     if premiered:
@@ -147,7 +136,6 @@ def scrape_myanimelist(anime_id: int):
         if y:
             released_year = int(y.group(1))
 
-    # Karakter
     characters = get_characters(canonical_url, headers)
 
     flat = {
@@ -175,66 +163,36 @@ def scrape_myanimelist(anime_id: int):
         "characters": characters,
         "source_url": canonical_url,
     }
-
     return flat
 
 
-# ------------------------------
-#  CSV WRITER
-# ------------------------------
-def append_to_csv(data_list, filename):
-    if not data_list:
-        return
-    fieldnames = list(data_list[0].keys())
+def append_to_csv(data, filename):
+    row = {k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v for k, v in data.items()}
     write_header = not os.path.exists(filename)
     with open(filename, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=row.keys())
         if write_header:
             writer.writeheader()
-        for data in data_list:
-            row = {k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v for k, v in data.items()}
-            writer.writerow(row)
+        writer.writerow(row)
 
 
-# ------------------------------
-#  MAIN LOOP (Parallel)
-# ------------------------------
+# ==========================================
+# MAIN LOOP
+# ==========================================
 if __name__ == "__main__":
-    output_file = "mal_anime_auto_scrape_parallel.csv"
     consecutive_404 = 0
-    anime_id = 1
-    BATCH_SIZE = 8  # scrape 8 id sekaligus
-    MAX_WORKERS = 4
 
-    print("🚀 Mulai scraping paralel dengan 4 thread...")
-
-    while consecutive_404 < 100:
-        batch = list(range(anime_id, anime_id + BATCH_SIZE))
-        anime_id += BATCH_SIZE
-        results = []
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(scrape_myanimelist, aid): aid for aid in batch}
-            for future in as_completed(futures):
-                aid = futures[future]
-                try:
-                    data = future.result()
-                    if data:
-                        results.append(data)
-                        print(f"✅ Berhasil ID {aid}")
-                    else:
-                        consecutive_404 += 1
-                except Exception as e:
-                    print(f"⚠️ Error ID {aid}: {e}")
-                    consecutive_404 += 1
-
-        append_to_csv(results, output_file)
-
-        # Reset jika ada yang valid
-        if results:
+    print(f"Memulai scraping dari ID={START_ID} sampai {END_ID} ...")
+    for anime_id in range(START_ID, END_ID + 1):
+        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        data = scrape_myanimelist(anime_id, headers)
+        if data:
+            append_to_csv(data, OUTPUT_FILE)
             consecutive_404 = 0
-
-        # Delay ringan antara batch
-        time.sleep(random.uniform(0.2, 1))
-
-    print(f"🛑 Dihentikan setelah {consecutive_404} anime berturut-turut tidak ditemukan.")
+        else:
+            consecutive_404 += 1
+            if consecutive_404 >= MAX_CONSECUTIVE_404:
+                print(f"Berhenti: {MAX_CONSECUTIVE_404} anime berturut-turut tidak ditemukan.")
+                break
+        time.sleep(random.uniform(0.2, 0.5))
+    print("Selesai.")
