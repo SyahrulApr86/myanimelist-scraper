@@ -182,9 +182,16 @@ def scrape_myanimelist(anime_id: int, headers):
 
 def append_to_csv(data, filename):
     row = {k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v for k, v in data.items()}
+
+    # Reorder kolom agar csv_index di awal
+    fieldnames = list(row.keys())
+    if 'csv_index' in fieldnames:
+        fieldnames.remove('csv_index')
+        fieldnames.insert(0, 'csv_index')
+
     write_header = not os.path.exists(filename)
     with open(filename, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=row.keys())
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
         writer.writerow(row)
@@ -216,7 +223,7 @@ def check_null_values(data):
     optional_fields = ['End_year']
 
     # Kolom yang boleh bernilai "Unknown" (untuk anime ongoing/incomplete)
-    can_be_unknown = ['Episodes', 'Status', 'Premiered', 'Released_Season', 'Released_Year']
+    can_be_unknown = ['Episodes', 'Status', 'Premiered', 'Released_Season', 'Released_Year', 'Duration']
 
     # Kolom yang boleh bernilai "N/A" (untuk anime yang belum ada data)
     can_be_na = ['Score', 'Ranked']
@@ -266,7 +273,7 @@ def fix_singular_plural_fields(data):
     return fixed_fields
 
 
-def scrape_with_retry(anime_id, max_retries=4):
+def scrape_with_retry(anime_id, max_retries=4, index=None):
     """
     Scrape anime dengan retry untuk mengisi field yang null.
     Hanya update field yang null, tidak re-scrape semua.
@@ -278,6 +285,10 @@ def scrape_with_retry(anime_id, max_retries=4):
     if not data:
         # Anime tidak ditemukan (404)
         return None
+
+    # Tambahkan index ke data
+    if index is not None:
+        data['csv_index'] = index
 
     # Print URL anime yang sedang di-scrape
     url = data.get('source_url', f'https://myanimelist.net/anime/{anime_id}')
@@ -341,7 +352,7 @@ def scrape_with_retry(anime_id, max_retries=4):
         # Update hanya field yang null
         updated_fields = []
         # Field yang boleh bernilai "Unknown"
-        can_be_unknown = ['Episodes', 'Status', 'Premiered', 'Released_Season', 'Released_Year']
+        can_be_unknown = ['Episodes', 'Status', 'Premiered', 'Released_Season', 'Released_Year', 'Duration']
         # Field yang boleh bernilai "N/A"
         can_be_na = ['Score', 'Ranked']
 
