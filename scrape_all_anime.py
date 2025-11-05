@@ -28,11 +28,11 @@ USER_AGENTS = [
 # ==========================================
 def get_characters(anime_url: str, headers):
     characters_url = anime_url.rstrip("/") + "/characters"
-    print(f"Mengambil karakter dari {characters_url}")
+    # Removed verbose print - only print on error
 
     res = requests.get(characters_url, headers=headers)
     if res.status_code != 200:
-        print(f"Gagal mengambil karakter ({res.status_code})")
+        # Hanya print kalau error
         return []
 
     soup = BeautifulSoup(res.text, "html.parser")
@@ -59,10 +59,10 @@ def scrape_myanimelist(anime_id: int, headers):
     url = f"https://myanimelist.net/anime/{anime_id}"
     res = requests.get(url, headers=headers)
     if res.status_code == 404:
-        print(f"{anime_id} not found")
+        # Silent 404, akan di-handle di caller
         return None
     if res.status_code != 200:
-        print(f"Gagal ambil ID {anime_id} ({res.status_code})")
+        # Hanya print kalau error bukan 404
         return None
 
     soup = BeautifulSoup(res.text, "html.parser")
@@ -138,6 +138,12 @@ def scrape_myanimelist(anime_id: int, headers):
 
     characters = get_characters(canonical_url, headers)
 
+    # Cek singular/plural untuk field yang bisa berbeda
+    genres = info.get("Genres") or info.get("Genre")
+    themes = info.get("Themes") or info.get("Theme")
+    studios = info.get("Studios") or info.get("Studio")
+    producers = info.get("Producers") or info.get("Producer")
+
     flat = {
         "myanimelist_id": anime_id,
         "title": title,
@@ -150,8 +156,10 @@ def scrape_myanimelist(anime_id: int, headers):
         "Released_Season": released_season,
         "Released_Year": released_year,
         "Source": info.get("Source"),
-        "Genres": info.get("Genres"),
-        "Themes": info.get("Themes"),
+        "Genres": genres,
+        "Themes": themes,
+        "Studios": studios,
+        "Producers": producers,
         "Demographic": info.get("Demographic"),
         "Duration": info.get("Duration"),
         "Rating": info.get("Rating"),
@@ -177,22 +185,198 @@ def append_to_csv(data, filename):
 
 
 # ==========================================
+# RETRY LOGIC
+# ==========================================
+
+# Mapping singular <-> plural untuk field yang bisa berubah
+FIELD_VARIANTS = {
+    'Genre': 'Genres',
+    'Genres': 'Genre',
+    'Theme': 'Themes',
+    'Themes': 'Theme',
+    'Studio': 'Studios',
+    'Studios': 'Studio',
+    'Producer': 'Producers',
+    'Producers': 'Producer',
+}
+
+def check_null_values(data):
+    """
+    Cek apakah ada nilai null/None/empty pada kolom penting.
+    Return list of kolom yang null.
+    """
+    # Kolom yang BENAR-BENAR boleh null (karena tidak semua anime punya)
+    # End_year: untuk anime ongoing yang belum selesai
+    optional_fields = ['End_year']
+
+    # Kolom yang boleh bernilai "Unknown" (untuk anime ongoing/incomplete)
+    can_be_unknown = ['Episodes', 'Status', 'Premiered', 'Released_Season', 'Released_Year']
+
+    null_fields = []
+    for key, value in data.items():
+        # Skip kolom opsional
+        if key in optional_fields:
+            continue
+
+        # Cek null/None/empty
+        if value is None or value == '':
+            null_fields.append(key)
+        elif value == 'Unknown':
+            # Untuk field tertentu, "Unknown" itu valid
+            if key not in can_be_unknown:
+                null_fields.append(key)
+
+        # Cek untuk list kosong termasuk characters
+        if isinstance(value, list) and len(value) == 0:
+            if key == 'characters':
+                # Characters kosong juga dianggap null, perlu retry
+                null_fields.append(key)
+
+    return null_fields
+
+
+def fix_singular_plural_fields(data):
+    """
+    Cek apakah field yang null punya versi singular/plural.
+    Jika ada, copy nilainya. Return list field yang berhasil di-fix.
+    """
+    fixed_fields = []
+
+    for field_name, variant_name in FIELD_VARIANTS.items():
+        # Cek jika field null tapi variant-nya ada nilai
+        if field_name in data and (data[field_name] is None or data[field_name] == '' or data[field_name] == 'Unknown'):
+            if variant_name in data and data[variant_name] is not None and data[variant_name] != '' and data[variant_name] != 'Unknown':
+                # Copy dari variant
+                data[field_name] = data[variant_name]
+                fixed_fields.append(f"{field_name} ← {variant_name}")
+
+    return fixed_fields
+
+
+def scrape_with_retry(anime_id, max_retries=5):
+    """
+    Scrape anime dengan retry untuk mengisi field yang null.
+    Hanya update field yang null, tidak re-scrape semua.
+    """
+    # Scrape pertama kali
+    headers = {"User-Agent": random.choice(USER_AGENTS)}
+    data = scrape_myanimelist(anime_id, headers)
+
+    if not data:
+        # Anime tidak ditemukan (404)
+        return None
+
+    # Print URL anime yang sedang di-scrape
+    url = data.get('source_url', f'https://myanimelist.net/anime/{anime_id}')
+    print(f"{url}", end=" ")
+
+    # Cek null values
+    null_fields = check_null_values(data)
+
+    if not null_fields:
+        # Tidak ada null, berhasil!
+        return data
+
+    # Ada field yang null, coba fix dengan singular/plural dulu
+    fixed = fix_singular_plural_fields(data)
+    if fixed:
+        print(f"\n  ✓ Fixed singular/plural: {fixed}", end=" ")
+        # Cek lagi setelah di-fix
+        null_fields = check_null_values(data)
+        if not null_fields:
+            return data
+
+    # Field yang memang bisa tidak ada (semi-optional)
+    semi_optional_fields = {'Premiered', 'Released_Season', 'Released_Year', 'Demographic', 'Themes'}
+
+    # Cek apakah null fields hanya berisi semi-optional fields
+    only_semi_optional = all(field in semi_optional_fields for field in null_fields)
+
+    # Tentukan max retries
+    actual_max_retries = 3 if only_semi_optional else max_retries
+
+    if only_semi_optional:
+        print(f"\n  ⚠ Found null fields (semi-optional): {null_fields} → retry max 3x")
+    else:
+        print(f"\n  ⚠ Found null fields: {null_fields}")
+
+    for attempt in range(1, actual_max_retries + 1):
+        print(f"  → Retry attempt {attempt}/{actual_max_retries}...")
+        time.sleep(random.uniform(0.1, .5))  # Delay lebih lama untuk retry
+
+        # Scrape ulang
+        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        new_data = scrape_myanimelist(anime_id, headers)
+
+        if not new_data:
+            print(f"  ✗ Retry gagal (error scraping)")
+            break
+
+        # Update hanya field yang null
+        updated_fields = []
+        for field in null_fields:
+            # Special handling untuk characters (list)
+            if field == 'characters':
+                if field in new_data and isinstance(new_data[field], list) and len(new_data[field]) > 0:
+                    # Characters sekarang ada isinya
+                    data[field] = new_data[field]
+                    updated_fields.append(field)
+            else:
+                # Field biasa
+                if field in new_data and new_data[field] is not None and new_data[field] != '' and new_data[field] != 'Unknown':
+                    # Field yang tadinya null sekarang ada nilainya
+                    data[field] = new_data[field]
+                    updated_fields.append(field)
+
+        if updated_fields:
+            print(f"  ✓ Berhasil update: {updated_fields}", end=" ")
+
+        # Coba fix singular/plural lagi dari hasil retry
+        fixed = fix_singular_plural_fields(data)
+        if fixed:
+            print(f"\n  ✓ Fixed singular/plural: {fixed}", end=" ")
+
+        # Cek lagi apakah masih ada yang null
+        null_fields = check_null_values(data)
+
+        if not null_fields:
+            print(f"\n  ✓ Semua field terisi setelah {attempt} retries", end=" ")
+            return data
+
+    # Masih ada yang null setelah max retries
+    if null_fields:
+        print(f"\n  ✗ Max retries reached, masih ada null: {null_fields}", end=" ")
+
+    return data
+
+
+# ==========================================
 # MAIN LOOP
 # ==========================================
 if __name__ == "__main__":
     consecutive_404 = 0
 
     print(f"Memulai scraping dari ID={START_ID} sampai {END_ID} ...")
+    print()
+
     for anime_id in range(START_ID, END_ID + 1):
-        headers = {"User-Agent": random.choice(USER_AGENTS)}
-        data = scrape_myanimelist(anime_id, headers)
+        print(f"[ID {anime_id}] ", end="")
+
+        data = scrape_with_retry(anime_id, max_retries=5)
+
         if data:
             append_to_csv(data, OUTPUT_FILE)
             consecutive_404 = 0
+            print("→ ✓ Saved")
         else:
             consecutive_404 += 1
+            print("✗ Not found (404)")
             if consecutive_404 >= MAX_CONSECUTIVE_404:
-                print(f"Berhenti: {MAX_CONSECUTIVE_404} anime berturut-turut tidak ditemukan.")
+                print(f"\nBerhenti: {MAX_CONSECUTIVE_404} anime berturut-turut tidak ditemukan.")
                 break
+
         time.sleep(random.uniform(0.2, 0.5))
-    print("Selesai.")
+
+    print("\n" + "="*80)
+    print("Selesai!")
+    print("="*80)
