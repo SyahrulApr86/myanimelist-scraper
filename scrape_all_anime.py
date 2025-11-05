@@ -61,10 +61,10 @@ def scrape_myanimelist(anime_id: int, headers):
     res = requests.get(url, headers=headers)
     if res.status_code == 404:
         # Silent 404, akan di-handle di caller
-        return None
+        return None, 404
     if res.status_code != 200:
         # Hanya print kalau error bukan 404
-        return None
+        return None, res.status_code
 
     soup = BeautifulSoup(res.text, "html.parser")
 
@@ -177,7 +177,7 @@ def scrape_myanimelist(anime_id: int, headers):
         "characters": characters,
         "source_url": canonical_url,
     }
-    return flat
+    return flat, 200
 
 
 def append_to_csv(data, filename):
@@ -277,14 +277,15 @@ def scrape_with_retry(anime_id, max_retries=4, index=None):
     """
     Scrape anime dengan retry untuk mengisi field yang null.
     Hanya update field yang null, tidak re-scrape semua.
+    Return: (data, status_code)
     """
     # Scrape pertama kali
     headers = {"User-Agent": random.choice(USER_AGENTS)}
-    data = scrape_myanimelist(anime_id, headers)
+    data, status_code = scrape_myanimelist(anime_id, headers)
 
     if not data:
-        # Anime tidak ditemukan (404)
-        return None
+        # Anime tidak ditemukan atau error
+        return None, status_code
 
     # Tambahkan index ke data
     if index is not None:
@@ -299,7 +300,7 @@ def scrape_with_retry(anime_id, max_retries=4, index=None):
 
     if not null_fields:
         # Tidak ada null, berhasil!
-        return data
+        return data, status_code
 
     # Ada field yang null, coba fix dengan singular/plural dulu
     fixed = fix_singular_plural_fields(data)
@@ -308,7 +309,7 @@ def scrape_with_retry(anime_id, max_retries=4, index=None):
         # Cek lagi setelah di-fix
         null_fields = check_null_values(data)
         if not null_fields:
-            return data
+            return data, status_code
 
     # Field yang memang bisa tidak ada (semi-optional) - langsung null, tidak retry
     semi_optional_fields = {'Premiered', 'Released_Season', 'Released_Year', 'Demographic', 'Themes', 'Genres'}
@@ -327,7 +328,7 @@ def scrape_with_retry(anime_id, max_retries=4, index=None):
         print(f"\n  ⚠ Found null fields (semi-optional only): {null_fields} → setting to null")
         for field in semi_nulls:
             data[field] = None
-        return data
+        return data, status_code
     elif not critical_nulls and limited_nulls:
         # Hanya limited retry (characters) dan/atau semi-optional
         actual_max_retries = 2
@@ -343,10 +344,10 @@ def scrape_with_retry(anime_id, max_retries=4, index=None):
 
         # Scrape ulang
         headers = {"User-Agent": random.choice(USER_AGENTS)}
-        new_data = scrape_myanimelist(anime_id, headers)
+        new_data, retry_status = scrape_myanimelist(anime_id, headers)
 
         if not new_data:
-            print(f"  ✗ Retry gagal (error scraping)")
+            print(f"  ✗ Retry gagal (error scraping, status: {retry_status})")
             break
 
         # Update hanya field yang null
@@ -391,7 +392,7 @@ def scrape_with_retry(anime_id, max_retries=4, index=None):
 
         if not null_fields:
             print(f"\n  ✓ Semua field terisi setelah {attempt} retries", end=" ")
-            return data
+            return data, status_code
 
         # Pisahkan lagi null fields yang tersisa
         remaining_critical = [f for f in null_fields if f not in semi_optional_fields and f not in limited_retry_fields]
@@ -405,13 +406,13 @@ def scrape_with_retry(anime_id, max_retries=4, index=None):
                 print(f"\n  ✓ Sisa null hanya semi-optional: {null_fields} → setting to null", end=" ")
                 for field in remaining_semi:
                     data[field] = None
-                return data
+                return data, status_code
             # Jika ada limited tapi sudah retry 2x, null-kan semua sisa (limited + semi)
             elif attempt >= 2:
                 print(f"\n  ✓ Sisa null: {null_fields} (limited retry reached) → setting to null", end=" ")
                 for field in null_fields:
                     data[field] = None
-                return data
+                return data, status_code
 
     # Masih ada yang null setelah max retries
     if null_fields:
@@ -427,7 +428,7 @@ def scrape_with_retry(anime_id, max_retries=4, index=None):
         else:
             print(f"\n  ✓ Max retries reached, non-critical nulls set to null: {final_nullables}", end=" ")
 
-    return data
+    return data, status_code
 
 
 # ==========================================
@@ -448,6 +449,9 @@ if __name__ == "__main__":
     print(f"Memulai scraping dari index {START_INDEX} sampai {end_idx} ({len(df_slice)} anime)")
     print()
 
+    consecutive_failures = 0  # Track consecutive non-2xx responses
+    MAX_CONSECUTIVE_FAILURES = 20
+
     for idx, row in df_slice.iterrows():
         url = row['url']
 
@@ -460,13 +464,23 @@ if __name__ == "__main__":
         anime_id = int(match.group(1))
         print(f"[Index {idx} | ID {anime_id}] ", end="")
 
-        data = scrape_with_retry(anime_id, max_retries=4)
+        data, status_code = scrape_with_retry(anime_id, max_retries=4, index=idx)
 
-        if data:
+        if data and status_code == 200:
             append_to_csv(data, OUTPUT_FILE)
+            consecutive_failures = 0  # Reset counter on success
             print("→ ✓ Saved")
         else:
-            print("✗ Not found (404)")
+            consecutive_failures += 1
+            print(f"✗ Failed (status: {status_code})")
+
+            # Cek apakah sudah 20 kali berturut-turut gagal
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                print(f"\n⚠ WARNING: {MAX_CONSECUTIVE_FAILURES} consecutive failures detected!")
+                print(f"⚠ Possible IP block. Sleeping for 10 seconds...")
+                time.sleep(10)
+                print(f"⚠ Resuming scraping...\n")
+                consecutive_failures = 0  # Reset counter
 
         time.sleep(random.uniform(0.2, 0.5))
 
