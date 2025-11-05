@@ -6,13 +6,14 @@ import os
 import re
 import random
 import time
+import pandas as pd
 
 # ==========================================
 # KONFIGURASI
 # ==========================================
-START_ID = 1          # ganti sesuai kebutuhan
-END_ID = 5000         # misal 1–5000
-MAX_CONSECUTIVE_404 = 100
+INPUT_CSV = "mal_all_season_anime.csv"  # CSV file dengan kolom 'url'
+START_INDEX = 0       # mulai dari index berapa (default 0)
+END_INDEX = -1        # berhenti di index berapa (-1 = sampai akhir)
 OUTPUT_FILE = "mal_anime_auto_scrape.csv"
 
 USER_AGENTS = [
@@ -100,7 +101,12 @@ def scrape_myanimelist(anime_id: int, headers):
     info = extract_section_between("Information", "Statistics")
 
     score_tag = soup.select_one('[itemprop="aggregateRating"] [itemprop="ratingValue"]')
-    score = score_tag.get_text(strip=True) if score_tag else None
+    if score_tag:
+        score = score_tag.get_text(strip=True)
+    else:
+        # Cek apakah Score adalah N/A
+        score_na_tag = soup.select_one('span.score-label.score-na')
+        score = score_na_tag.get_text(strip=True) if score_na_tag else None
 
     ranked_div = soup.find("div", {"data-id": "info2"})
     rank = None
@@ -212,6 +218,9 @@ def check_null_values(data):
     # Kolom yang boleh bernilai "Unknown" (untuk anime ongoing/incomplete)
     can_be_unknown = ['Episodes', 'Status', 'Premiered', 'Released_Season', 'Released_Year']
 
+    # Kolom yang boleh bernilai "N/A" (untuk anime yang belum ada data)
+    can_be_na = ['Score', 'Ranked']
+
     null_fields = []
     for key, value in data.items():
         # Skip kolom opsional
@@ -224,6 +233,10 @@ def check_null_values(data):
         elif value == 'Unknown':
             # Untuk field tertentu, "Unknown" itu valid
             if key not in can_be_unknown:
+                null_fields.append(key)
+        elif value == 'N/A':
+            # Untuk field tertentu, "N/A" itu valid
+            if key not in can_be_na:
                 null_fields.append(key)
 
         # Cek untuk list kosong termasuk characters
@@ -253,7 +266,7 @@ def fix_singular_plural_fields(data):
     return fixed_fields
 
 
-def scrape_with_retry(anime_id, max_retries=5):
+def scrape_with_retry(anime_id, max_retries=4):
     """
     Scrape anime dengan retry untuk mengisi field yang null.
     Hanya update field yang null, tidak re-scrape semua.
@@ -287,21 +300,23 @@ def scrape_with_retry(anime_id, max_retries=5):
             return data
 
     # Field yang memang bisa tidak ada (semi-optional)
-    semi_optional_fields = {'Premiered', 'Released_Season', 'Released_Year', 'Demographic', 'Themes'}
+    semi_optional_fields = {'Premiered', 'Released_Season', 'Released_Year', 'Demographic', 'Themes', 'Genres'}
 
     # Cek apakah null fields hanya berisi semi-optional fields
     only_semi_optional = all(field in semi_optional_fields for field in null_fields)
 
-    # Tentukan max retries
-    actual_max_retries = 3 if only_semi_optional else max_retries
-
     if only_semi_optional:
-        print(f"\n  ⚠ Found null fields (semi-optional): {null_fields} → retry max 3x")
-    else:
-        print(f"\n  ⚠ Found null fields: {null_fields}")
+        # Jika hanya semi-optional yang null, langsung set ke null tanpa retry
+        print(f"\n  ⚠ Found null fields (semi-optional only): {null_fields} → setting to null")
+        for field in null_fields:
+            data[field] = None
+        return data
 
-    for attempt in range(1, actual_max_retries + 1):
-        print(f"  → Retry attempt {attempt}/{actual_max_retries}...")
+    # Ada critical fields yang null, perlu retry
+    print(f"\n  ⚠ Found null fields: {null_fields}")
+
+    for attempt in range(1, max_retries + 1):
+        print(f"  → Retry attempt {attempt}/{max_retries}...")
         time.sleep(random.uniform(0.1, .5))  # Delay lebih lama untuk retry
 
         # Scrape ulang
@@ -314,6 +329,11 @@ def scrape_with_retry(anime_id, max_retries=5):
 
         # Update hanya field yang null
         updated_fields = []
+        # Field yang boleh bernilai "Unknown"
+        can_be_unknown = ['Episodes', 'Status', 'Premiered', 'Released_Season', 'Released_Year']
+        # Field yang boleh bernilai "N/A"
+        can_be_na = ['Score', 'Ranked']
+
         for field in null_fields:
             # Special handling untuk characters (list)
             if field == 'characters':
@@ -323,8 +343,16 @@ def scrape_with_retry(anime_id, max_retries=5):
                     updated_fields.append(field)
             else:
                 # Field biasa
-                if field in new_data and new_data[field] is not None and new_data[field] != '' and new_data[field] != 'Unknown':
-                    # Field yang tadinya null sekarang ada nilainya
+                if field in new_data and new_data[field] is not None and new_data[field] != '':
+                    # Untuk field tertentu, "Unknown" adalah nilai valid
+                    if new_data[field] == 'Unknown' and field not in can_be_unknown:
+                        # "Unknown" tidak valid untuk field ini, skip
+                        continue
+                    # Untuk field tertentu, "N/A" adalah nilai valid
+                    if new_data[field] == 'N/A' and field not in can_be_na:
+                        # "N/A" tidak valid untuk field ini, skip
+                        continue
+                    # Field yang tadinya null sekarang ada nilainya (bisa juga "Unknown" atau "N/A" untuk field tertentu)
                     data[field] = new_data[field]
                     updated_fields.append(field)
 
@@ -343,7 +371,15 @@ def scrape_with_retry(anime_id, max_retries=5):
             print(f"\n  ✓ Semua field terisi setelah {attempt} retries", end=" ")
             return data
 
-    # Masih ada yang null setelah max retries
+        # Cek apakah sisa null fields hanya semi-optional
+        only_semi_optional_remaining = all(field in semi_optional_fields for field in null_fields)
+        if only_semi_optional_remaining:
+            print(f"\n  ✓ Sisa null hanya semi-optional: {null_fields} → setting to null", end=" ")
+            for field in null_fields:
+                data[field] = None
+            return data
+
+    # Masih ada critical fields yang null setelah max retries
     if null_fields:
         print(f"\n  ✗ Max retries reached, masih ada null: {null_fields}", end=" ")
 
@@ -354,29 +390,42 @@ def scrape_with_retry(anime_id, max_retries=5):
 # MAIN LOOP
 # ==========================================
 if __name__ == "__main__":
-    consecutive_404 = 0
+    # Load CSV file
+    print(f"Loading URLs from {INPUT_CSV}...")
+    df = pd.read_csv(INPUT_CSV)
 
-    print(f"Memulai scraping dari ID={START_ID} sampai {END_ID} ...")
+    # Determine end index
+    total_rows = len(df)
+    end_idx = total_rows if END_INDEX == -1 else min(END_INDEX, total_rows)
+
+    # Slice dataframe based on START_INDEX and END_INDEX
+    df_slice = df.iloc[START_INDEX:end_idx]
+
+    print(f"Memulai scraping dari index {START_INDEX} sampai {end_idx} ({len(df_slice)} anime)")
     print()
 
-    for anime_id in range(START_ID, END_ID + 1):
-        print(f"[ID {anime_id}] ", end="")
+    for idx, row in df_slice.iterrows():
+        url = row['url']
 
-        data = scrape_with_retry(anime_id, max_retries=5)
+        # Extract anime_id from URL
+        match = re.search(r'/anime/(\d+)', url)
+        if not match:
+            print(f"[Index {idx}] ✗ Invalid URL: {url}")
+            continue
+
+        anime_id = int(match.group(1))
+        print(f"[Index {idx} | ID {anime_id}] ", end="")
+
+        data = scrape_with_retry(anime_id, max_retries=4)
 
         if data:
             append_to_csv(data, OUTPUT_FILE)
-            consecutive_404 = 0
             print("→ ✓ Saved")
         else:
-            consecutive_404 += 1
             print("✗ Not found (404)")
-            if consecutive_404 >= MAX_CONSECUTIVE_404:
-                print(f"\nBerhenti: {MAX_CONSECUTIVE_404} anime berturut-turut tidak ditemukan.")
-                break
 
         time.sleep(random.uniform(0.2, 0.5))
 
     print("\n" + "="*80)
-    print("Selesai!")
+    print(f"Selesai! Processed {len(df_slice)} anime from index {START_INDEX} to {end_idx}")
     print("="*80)
