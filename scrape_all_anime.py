@@ -7,14 +7,24 @@ import re
 import random
 import time
 import pandas as pd
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # ==========================================
 # KONFIGURASI
 # ==========================================
 INPUT_CSV = "mal_all_season_anime.csv"  # CSV file dengan kolom 'url'
-START_INDEX = 0       # mulai dari index berapa (default 0)
+START_INDEX = 140       # mulai dari index berapa (default 0)
 END_INDEX = -1        # berhenti di index berapa (-1 = sampai akhir)
 OUTPUT_FILE = "mal_anime_auto_scrape.csv"
+
+# Proxy configuration (loaded from .env file)
+USE_PROXY = True
+PROXY_HOST = os.getenv("PROXY_HOST", "")
+PROXY_USER = os.getenv("PROXY_USER", "")
+PROXY_PASS = os.getenv("PROXY_PASS", "")
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
@@ -27,11 +37,29 @@ USER_AGENTS = [
 # ==========================================
 # SCRAPER FUNGSI
 # ==========================================
+def get_proxies():
+    """Generate proxy configuration for requests"""
+    if not USE_PROXY:
+        return None
+
+    proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}"
+    return {
+        'http': proxy_url,
+        'https': proxy_url
+    }
+
+
 def get_characters(anime_url: str, headers):
     characters_url = anime_url.rstrip("/") + "/characters"
     # Removed verbose print - only print on error
 
-    res = requests.get(characters_url, headers=headers)
+    proxies = get_proxies()
+    try:
+        res = requests.get(characters_url, headers=headers, proxies=proxies, timeout=30)
+    except requests.exceptions.RequestException:
+        # Connection error, timeout, proxy error
+        return []
+
     if res.status_code != 200:
         # Hanya print kalau error
         return []
@@ -58,7 +86,14 @@ def get_characters(anime_url: str, headers):
 
 def scrape_myanimelist(anime_id: int, headers):
     url = f"https://myanimelist.net/anime/{anime_id}"
-    res = requests.get(url, headers=headers)
+    proxies = get_proxies()
+
+    try:
+        res = requests.get(url, headers=headers, proxies=proxies, timeout=30)
+    except requests.exceptions.RequestException as e:
+        # Connection error, timeout, proxy error, etc.
+        return None, 0
+
     if res.status_code == 404:
         # Silent 404, akan di-handle di caller
         return None, 404
@@ -447,6 +482,10 @@ if __name__ == "__main__":
     df_slice = df.iloc[START_INDEX:end_idx]
 
     print(f"Memulai scraping dari index {START_INDEX} sampai {end_idx} ({len(df_slice)} anime)")
+    if USE_PROXY:
+        print(f"Using proxy: {PROXY_HOST}")
+    else:
+        print("Not using proxy (direct connection)")
     print()
 
     consecutive_failures = 0  # Track consecutive non-2xx responses
