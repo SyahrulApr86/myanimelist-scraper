@@ -299,24 +299,35 @@ def scrape_with_retry(anime_id, max_retries=4):
         if not null_fields:
             return data
 
-    # Field yang memang bisa tidak ada (semi-optional)
+    # Field yang memang bisa tidak ada (semi-optional) - langsung null, tidak retry
     semi_optional_fields = {'Premiered', 'Released_Season', 'Released_Year', 'Demographic', 'Themes', 'Genres'}
 
-    # Cek apakah null fields hanya berisi semi-optional fields
-    only_semi_optional = all(field in semi_optional_fields for field in null_fields)
+    # Field yang butuh retry terbatas (retry max 2x)
+    limited_retry_fields = {'characters'}
 
-    if only_semi_optional:
-        # Jika hanya semi-optional yang null, langsung set ke null tanpa retry
+    # Pisahkan null fields berdasarkan kategori
+    critical_nulls = [f for f in null_fields if f not in semi_optional_fields and f not in limited_retry_fields]
+    limited_nulls = [f for f in null_fields if f in limited_retry_fields]
+    semi_nulls = [f for f in null_fields if f in semi_optional_fields]
+
+    # Tentukan strategi retry
+    if not critical_nulls and not limited_nulls:
+        # Hanya semi-optional yang null, langsung set ke null tanpa retry
         print(f"\n  ⚠ Found null fields (semi-optional only): {null_fields} → setting to null")
-        for field in null_fields:
+        for field in semi_nulls:
             data[field] = None
         return data
+    elif not critical_nulls and limited_nulls:
+        # Hanya limited retry (characters) dan/atau semi-optional
+        actual_max_retries = 2
+        print(f"\n  ⚠ Found null fields (limited retry): {null_fields} → retry max {actual_max_retries}x")
+    else:
+        # Ada critical fields
+        actual_max_retries = max_retries
+        print(f"\n  ⚠ Found null fields: {null_fields}")
 
-    # Ada critical fields yang null, perlu retry
-    print(f"\n  ⚠ Found null fields: {null_fields}")
-
-    for attempt in range(1, max_retries + 1):
-        print(f"  → Retry attempt {attempt}/{max_retries}...")
+    for attempt in range(1, actual_max_retries + 1):
+        print(f"  → Retry attempt {attempt}/{actual_max_retries}...")
         time.sleep(random.uniform(0.1, .5))  # Delay lebih lama untuk retry
 
         # Scrape ulang
@@ -371,17 +382,39 @@ def scrape_with_retry(anime_id, max_retries=4):
             print(f"\n  ✓ Semua field terisi setelah {attempt} retries", end=" ")
             return data
 
-        # Cek apakah sisa null fields hanya semi-optional
-        only_semi_optional_remaining = all(field in semi_optional_fields for field in null_fields)
-        if only_semi_optional_remaining:
-            print(f"\n  ✓ Sisa null hanya semi-optional: {null_fields} → setting to null", end=" ")
-            for field in null_fields:
-                data[field] = None
-            return data
+        # Pisahkan lagi null fields yang tersisa
+        remaining_critical = [f for f in null_fields if f not in semi_optional_fields and f not in limited_retry_fields]
+        remaining_limited = [f for f in null_fields if f in limited_retry_fields]
+        remaining_semi = [f for f in null_fields if f in semi_optional_fields]
 
-    # Masih ada critical fields yang null setelah max retries
+        # Jika tidak ada critical yang tersisa
+        if not remaining_critical:
+            # Jika hanya semi-optional, langsung null-kan
+            if not remaining_limited:
+                print(f"\n  ✓ Sisa null hanya semi-optional: {null_fields} → setting to null", end=" ")
+                for field in remaining_semi:
+                    data[field] = None
+                return data
+            # Jika ada limited tapi sudah retry 2x, null-kan semua sisa (limited + semi)
+            elif attempt >= 2:
+                print(f"\n  ✓ Sisa null: {null_fields} (limited retry reached) → setting to null", end=" ")
+                for field in null_fields:
+                    data[field] = None
+                return data
+
+    # Masih ada yang null setelah max retries
     if null_fields:
-        print(f"\n  ✗ Max retries reached, masih ada null: {null_fields}", end=" ")
+        # Null-kan field yang semi-optional dan limited (yang sudah mencapai max retry)
+        final_critical = [f for f in null_fields if f not in semi_optional_fields and f not in limited_retry_fields]
+        final_nullables = [f for f in null_fields if f in semi_optional_fields or f in limited_retry_fields]
+
+        for field in final_nullables:
+            data[field] = None
+
+        if final_critical:
+            print(f"\n  ✗ Max retries reached, masih ada critical null: {final_critical}", end=" ")
+        else:
+            print(f"\n  ✓ Max retries reached, non-critical nulls set to null: {final_nullables}", end=" ")
 
     return data
 
