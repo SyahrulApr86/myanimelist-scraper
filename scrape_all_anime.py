@@ -8,6 +8,8 @@ import random
 import time
 import pandas as pd
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # Load environment variables from .env file
 load_dotenv()
@@ -16,9 +18,10 @@ load_dotenv()
 # KONFIGURASI
 # ==========================================
 INPUT_CSV = "mal_all_season_anime.csv"  # CSV file dengan kolom 'url'
-START_INDEX = 140       # mulai dari index berapa (default 0)
+START_INDEX = 142       # mulai dari index berapa (default 0)
 END_INDEX = -1        # berhenti di index berapa (-1 = sampai akhir)
 OUTPUT_FILE = "mal_anime_auto_scrape.csv"
+NUM_WORKERS = 10         # jumlah thread paralel
 
 # Proxy configuration (loaded from .env file)
 USE_PROXY = True
@@ -32,6 +35,11 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/130.0",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
 ]
+
+# Thread-safe locks
+csv_lock = threading.Lock()
+counter_lock = threading.Lock()
+print_lock = threading.Lock()
 
 
 # ==========================================
@@ -224,12 +232,14 @@ def append_to_csv(data, filename):
         fieldnames.remove('csv_index')
         fieldnames.insert(0, 'csv_index')
 
-    write_header = not os.path.exists(filename)
-    with open(filename, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    # Thread-safe CSV writing
+    with csv_lock:
+        write_header = not os.path.exists(filename)
+        with open(filename, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
 
 
 # ==========================================
@@ -467,6 +477,76 @@ def scrape_with_retry(anime_id, max_retries=4, index=None):
 
 
 # ==========================================
+# WORKER FUNCTION
+# ==========================================
+class FailureCounter:
+    """Thread-safe failure counter"""
+    def __init__(self):
+        self.count = 0
+        self.lock = threading.Lock()
+
+    def increment(self):
+        with self.lock:
+            self.count += 1
+            return self.count
+
+    def reset(self):
+        with self.lock:
+            self.count = 0
+
+    def get(self):
+        with self.lock:
+            return self.count
+
+
+failure_counter = FailureCounter()
+MAX_CONSECUTIVE_FAILURES = 20
+
+
+def process_anime(idx, url):
+    """
+    Worker function untuk memproses satu anime.
+    Return: (success: bool, status_code: int)
+    """
+    # Extract anime_id from URL
+    match = re.search(r'/anime/(\d+)', url)
+    if not match:
+        with print_lock:
+            print(f"[Index {idx}] ✗ Invalid URL: {url}")
+        return False, 0
+
+    anime_id = int(match.group(1))
+
+    with print_lock:
+        print(f"[Index {idx} | ID {anime_id}] ", end="", flush=True)
+
+    data, status_code = scrape_with_retry(anime_id, max_retries=4, index=idx)
+
+    if data and status_code == 200:
+        append_to_csv(data, OUTPUT_FILE)
+        failure_counter.reset()  # Reset counter on success
+        with print_lock:
+            print("→ ✓ Saved")
+        return True, status_code
+    else:
+        fail_count = failure_counter.increment()
+        with print_lock:
+            print(f"✗ Failed (status: {status_code})")
+
+        # Cek apakah sudah 20 kali berturut-turut gagal
+        if fail_count >= MAX_CONSECUTIVE_FAILURES:
+            with print_lock:
+                print(f"\n⚠ WARNING: {MAX_CONSECUTIVE_FAILURES} consecutive failures detected!")
+                print(f"⚠ Possible IP block. Sleeping for 10 seconds...")
+            time.sleep(10)
+            with print_lock:
+                print(f"⚠ Resuming scraping...\n")
+            failure_counter.reset()  # Reset counter
+
+        return False, status_code
+
+
+# ==========================================
 # MAIN LOOP
 # ==========================================
 if __name__ == "__main__":
@@ -482,47 +562,42 @@ if __name__ == "__main__":
     df_slice = df.iloc[START_INDEX:end_idx]
 
     print(f"Memulai scraping dari index {START_INDEX} sampai {end_idx} ({len(df_slice)} anime)")
+    print(f"Running with {NUM_WORKERS} parallel workers")
     if USE_PROXY:
         print(f"Using proxy: {PROXY_HOST}")
     else:
         print("Not using proxy (direct connection)")
     print()
 
-    consecutive_failures = 0  # Track consecutive non-2xx responses
-    MAX_CONSECUTIVE_FAILURES = 20
+    # Prepare tasks
+    tasks = [(idx, row['url']) for idx, row in df_slice.iterrows()]
 
-    for idx, row in df_slice.iterrows():
-        url = row['url']
+    # Run parallel scraping
+    success_count = 0
+    failed_count = 0
 
-        # Extract anime_id from URL
-        match = re.search(r'/anime/(\d+)', url)
-        if not match:
-            print(f"[Index {idx}] ✗ Invalid URL: {url}")
-            continue
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        # Submit all tasks
+        futures = {executor.submit(process_anime, idx, url): (idx, url) for idx, url in tasks}
 
-        anime_id = int(match.group(1))
-        print(f"[Index {idx} | ID {anime_id}] ", end="")
+        # Process completed tasks
+        for future in as_completed(futures):
+            try:
+                success, status_code = future.result()
+                if success:
+                    success_count += 1
+                else:
+                    failed_count += 1
+            except Exception as e:
+                idx, url = futures[future]
+                with print_lock:
+                    print(f"[Index {idx}] ✗ Exception: {e}")
+                failed_count += 1
 
-        data, status_code = scrape_with_retry(anime_id, max_retries=4, index=idx)
-
-        if data and status_code == 200:
-            append_to_csv(data, OUTPUT_FILE)
-            consecutive_failures = 0  # Reset counter on success
-            print("→ ✓ Saved")
-        else:
-            consecutive_failures += 1
-            print(f"✗ Failed (status: {status_code})")
-
-            # Cek apakah sudah 20 kali berturut-turut gagal
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                print(f"\n⚠ WARNING: {MAX_CONSECUTIVE_FAILURES} consecutive failures detected!")
-                print(f"⚠ Possible IP block. Sleeping for 10 seconds...")
-                time.sleep(10)
-                print(f"⚠ Resuming scraping...\n")
-                consecutive_failures = 0  # Reset counter
-
-        time.sleep(random.uniform(0.2, 0.5))
+            # Small delay between processing completed tasks
+            time.sleep(random.uniform(0.1, 0.3))
 
     print("\n" + "="*80)
     print(f"Selesai! Processed {len(df_slice)} anime from index {START_INDEX} to {end_idx}")
+    print(f"Success: {success_count} | Failed: {failed_count}")
     print("="*80)
