@@ -18,10 +18,12 @@ load_dotenv()
 # KONFIGURASI
 # ==========================================
 INPUT_CSV = "mal_all_season_anime.csv"  # CSV file dengan kolom 'url'
-START_INDEX = 0       # mulai dari index berapa (default 0)
-END_INDEX = 7914        # berhenti di index berapa (-1 = sampai akhir)
 OUTPUT_FILE = "mal_anime_auto_scrape.csv"
-NUM_WORKERS = 1         # jumlah thread paralel
+
+# Configuration from .env file
+START_INDEX = int(os.getenv("START_INDEX", "0"))
+END_INDEX = int(os.getenv("END_INDEX", "-1"))
+NUM_WORKERS = int(os.getenv("NUM_WORKERS", "1"))
 
 # Proxy configuration (loaded from .env file)
 USE_PROXY = False
