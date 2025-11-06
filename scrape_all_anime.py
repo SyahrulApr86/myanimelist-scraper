@@ -17,7 +17,7 @@ load_dotenv()
 # ==========================================
 # KONFIGURASI
 # ==========================================
-INPUT_CSV = "mal_all_season_anime.csv"  # CSV file dengan kolom 'url'
+INPUT_CSV = "mal_anime_to_scrape.csv"  # CSV file dengan kolom 'url'
 OUTPUT_FILE = "mal_anime_auto_scrape.csv"
 
 # Configuration from .env file
