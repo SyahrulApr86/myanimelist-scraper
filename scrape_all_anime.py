@@ -18,13 +18,13 @@ load_dotenv()
 # KONFIGURASI
 # ==========================================
 INPUT_CSV = "mal_all_season_anime.csv"  # CSV file dengan kolom 'url'
-START_INDEX = 142       # mulai dari index berapa (default 0)
-END_INDEX = -1        # berhenti di index berapa (-1 = sampai akhir)
+START_INDEX = 0       # mulai dari index berapa (default 0)
+END_INDEX = 7914        # berhenti di index berapa (-1 = sampai akhir)
 OUTPUT_FILE = "mal_anime_auto_scrape.csv"
-NUM_WORKERS = 10         # jumlah thread paralel
+NUM_WORKERS = 1         # jumlah thread paralel
 
 # Proxy configuration (loaded from .env file)
-USE_PROXY = True
+USE_PROXY = False
 PROXY_HOST = os.getenv("PROXY_HOST", "")
 PROXY_USER = os.getenv("PROXY_USER", "")
 PROXY_PASS = os.getenv("PROXY_PASS", "")
@@ -561,7 +561,27 @@ if __name__ == "__main__":
     # Slice dataframe based on START_INDEX and END_INDEX
     df_slice = df.iloc[START_INDEX:end_idx]
 
-    print(f"Memulai scraping dari index {START_INDEX} sampai {end_idx} ({len(df_slice)} anime)")
+    # Check which indices already exist in output file
+    existing_indices = set()
+    if os.path.exists(OUTPUT_FILE):
+        print(f"Output file exists. Checking for already scraped indices...")
+        try:
+            df_output = pd.read_csv(OUTPUT_FILE)
+            if 'csv_index' in df_output.columns:
+                existing_indices = set(df_output['csv_index'].dropna().astype(int).tolist())
+                print(f"Found {len(existing_indices)} already scraped anime in output file")
+            else:
+                print(f"Warning: 'csv_index' column not found in output file. Will scrape all.")
+        except Exception as e:
+            print(f"Warning: Could not read output file: {e}. Will scrape all.")
+
+    # Filter tasks to only include indices that don't exist in output
+    all_tasks = [(idx, row['url']) for idx, row in df_slice.iterrows()]
+    tasks = [(idx, url) for idx, url in all_tasks if idx not in existing_indices]
+
+    print(f"\nRange: index {START_INDEX} to {end_idx} ({len(df_slice)} anime total)")
+    print(f"Already scraped: {len(existing_indices)} anime")
+    print(f"To be scraped: {len(tasks)} anime")
     print(f"Running with {NUM_WORKERS} parallel workers")
     if USE_PROXY:
         print(f"Using proxy: {PROXY_HOST}")
@@ -569,8 +589,9 @@ if __name__ == "__main__":
         print("Not using proxy (direct connection)")
     print()
 
-    # Prepare tasks
-    tasks = [(idx, row['url']) for idx, row in df_slice.iterrows()]
+    if len(tasks) == 0:
+        print("✓ All anime in range already scraped. Nothing to do!")
+        exit(0)
 
     # Run parallel scraping
     success_count = 0
@@ -598,6 +619,7 @@ if __name__ == "__main__":
             time.sleep(random.uniform(0.1, 0.3))
 
     print("\n" + "="*80)
-    print(f"Selesai! Processed {len(df_slice)} anime from index {START_INDEX} to {end_idx}")
+    print(f"Selesai! Attempted to scrape {len(tasks)} anime (from range {START_INDEX} to {end_idx})")
     print(f"Success: {success_count} | Failed: {failed_count}")
+    print(f"Total in output file now: {len(existing_indices) + success_count}")
     print("="*80)
