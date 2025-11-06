@@ -18,7 +18,7 @@ load_dotenv()
 # KONFIGURASI
 # ==========================================
 INPUT_CSV = "mal_anime_to_scrape.csv"  # CSV file dengan kolom 'url'
-OUTPUT_FILE = "mal_anime_auto_scrape.csv"
+OUTPUT_FILE = "mal_anime_scraped.csv"
 
 # Configuration from .env file
 START_INDEX = int(os.getenv("START_INDEX", "0"))
